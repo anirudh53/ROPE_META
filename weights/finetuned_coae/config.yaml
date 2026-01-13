@@ -1,0 +1,70 @@
+data:
+  directory: /data/rjlicata/tiegcm_ext_yearly/
+  suffix: _density_data.h5
+  test_years:
+  - 1997
+  - 1998
+  - 1999
+  - 2001
+  training_years:
+  - 1996
+  - 1997
+  - 1998
+  - 1999
+  - 2000
+  - 2001
+  - 2002
+  - 2003
+  - 2004
+  - 2005
+  - 2006
+  - 2007
+  - 2008
+  - 2009
+  validation_years:
+  - 1996
+  - 2000
+information:
+  epoch: 133
+  trial: /home/WVU-AD/rjlicata/ray_results/COAE_sampler_alt_SE_final_tuner_FULL/train_model_dc764_00266_266_activation_D_0=elu,activation_D_1=leakyrelu,activation_D_2=elu,activation_D_3=leakyrelu,activation_E_0_2024-02-22_14-46-13/
+model:
+  activation_D_0: elu
+  activation_D_1: leakyrelu
+  activation_D_2: elu
+  activation_D_3: leakyrelu
+  activation_E_0: relu
+  activation_E_1: elu
+  activation_E_2: softplus
+  activation_E_3: sigmoid
+  alpha: 0.06376698481413977
+  batch_size: 256
+  bottleneck_size: 10
+  lr: 1.0515824665448608e-05
+  num_decoder_upsamples: 4
+  num_encoder_downsamples: 3
+  num_filters_D_0: 16
+  num_filters_D_1: 128
+  num_filters_D_2: 128
+  num_filters_D_3: 64
+  num_filters_E_0: 32
+  num_filters_E_1: 32
+  num_filters_E_2: 64
+  num_filters_E_3: 128
+  num_layers_D_0: 1
+  num_layers_D_1: 2
+  num_layers_D_2: 1
+  num_layers_D_3: 2
+  num_layers_E_0: 1
+  num_layers_E_1: 2
+  num_layers_E_2: 2
+  num_layers_E_3: 1
+training:
+  batch_size: 256
+  epochs: 500
+  gamma: 0.5
+  learning_rate: 1.0515824665448608e-05
+  model_name: finetuning
+  optimizer: nadam
+  patience: 100
+  step_size: 50
+  tuner_name: COAE_sampler_alt_SE_final_tuner_FULL

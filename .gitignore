@@ -1,0 +1,12 @@
+# Large data and models 
+data/
+Models/
+weights/
+
+# Model files
+*.keras
+*.pth
+*.pt
+*.h5
+*.hdf5
+*.ckpt

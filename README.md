@@ -45,6 +45,22 @@ Configuration files for model architectures, hyperparameters, and experiment set
 ### `Models/`
 Trained latent-space forecasting models (LSTM, GRU, Transformer, etc.).
 
+#  Pretrained Models & Weights (External)
+
+Due to GitHub file size limitations, all trained models and large weight files are hosted on Google Drive.
+
+🔗 **Download here:**  
+https://drive.google.com/drive/folders/1qfT5ceAGaZhx4Dq2io7dxzVjWc-aWXgp?usp=sharing
+
+This repository contains:
+- COAE encoder / decoder weights  
+- Latent-space LSTM, GRU, and Transformer models  
+- Ensemble meta-models  
+- Normalization statistics and configuration files  
+
+After downloading, place the contents into the corresponding directories: Models/
+ 
+
 ---
 
 ### `Meta Models/`
@@ -109,21 +125,7 @@ This notebook is the best starting point for new users.
 
 ---
 
-##  Pretrained Models & Weights (External)
 
-Due to GitHub file size limitations, all trained models and large weight files are hosted on Google Drive.
-
-🔗 **Download here:**  
-https://drive.google.com/drive/folders/1qfT5ceAGaZhx4Dq2io7dxzVjWc-aWXgp?usp=sharing
-
-This repository contains:
-- COAE encoder / decoder weights  
-- Latent-space LSTM, GRU, and Transformer models  
-- Ensemble meta-models  
-- Normalization statistics and configuration files  
-
-After downloading, place the contents into the corresponding directories: Models/
- 
 
 
 ---

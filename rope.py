@@ -353,28 +353,57 @@ class ROPE:
     """
 
     def __init__(
+import os
+
+class ROPE:
+    def __init__(
         self,
         device: str = "cuda",
 
-        # ---- Paths (keep defaults if your structure matches) ----
-        driver_csv: str = "data/sw_celestrack_1957.csv",
-        ic_table_csv: str = "data/IC_Table_modified.csv",
+        # ---- Paths (portable across OS) ----
+        driver_csv: str = None,
+        ic_table_csv: str = None,
 
-        # IMPORTANT: this MUST match your training feature set
-        stats_ts_path: str = "data/stats_ts.pt",
-        stats_cae_path: str = "data/stats_cae.pt",
+        stats_ts_path: str = None,
+        stats_cae_path: str = None,
 
-        coae_config_yaml: str = "weights/finetuned_coae/config.yaml",
-        coae_weights_pth: str = "weights/finetuned_coae/best_weights_1gpu.pth",
+        coae_config_yaml: str = None,
+        coae_weights_pth: str = None,
 
-        lstm_dir: str = "Models/Storms/LSTM MODELS",
-        gru_dir: str = "Models/Storms/GRU MODELS",
-        transformer_dir: str = "Models/Storms/TRANSFORMER MODELS",
-        meta_model_path: str = "Meta Models/MetaStormTunedBLa0.keras",
+        lstm_dir: str = None,
+        gru_dir: str = None,
+        transformer_dir: str = None,
+        meta_model_path: str = None,
 
-        # --- behavior ---
-        use_xla: bool = False,   # set True only if you want XLA. False reduces compile spam.
+        use_xla: bool = False,
     ):
+
+        base = os.getcwd()   # or project root if you define one
+
+        self.driver_csv = driver_csv or os.path.join(base, "data", "sw_celestrack_1957.csv")
+        self.ic_table_csv = ic_table_csv or os.path.join(base, "data", "IC_Table_modified.csv")
+
+        self.stats_ts_path = stats_ts_path or os.path.join(base, "data", "stats_ts.pt")
+        self.stats_cae_path = stats_cae_path or os.path.join(base, "data", "stats_cae.pt")
+
+        self.coae_config_yaml = coae_config_yaml or os.path.join(
+            base, "weights", "finetuned_coae", "config.yaml"
+        )
+        self.coae_weights_pth = coae_weights_pth or os.path.join(
+            base, "weights", "finetuned_coae", "best_weights_1gpu.pth"
+        )
+
+        self.lstm_dir = lstm_dir or os.path.join(base, "Models", "Storms", "LSTM MODELS")
+        self.gru_dir = gru_dir or os.path.join(base, "Models", "Storms", "GRU MODELS")
+        self.transformer_dir = transformer_dir or os.path.join(base, "Models", "Storms", "TRANSFORMER MODELS")
+
+        self.meta_model_path = meta_model_path or os.path.join(
+            base, "Meta Models", "MetaStormTunedBLa0.keras"
+        )
+
+        self.device = device
+        self.use_xla = use_xla
+
         self.device = _safe_device(device)
 
         # NOTE: horizon is no longer stored in cfg; it is passed to run()

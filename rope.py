@@ -353,57 +353,28 @@ class ROPE:
     """
 
     def __init__(
-import os
-
-class ROPE:
-    def __init__(
         self,
         device: str = "cuda",
 
-        # ---- Paths (portable across OS) ----
-        driver_csv: str = None,
-        ic_table_csv: str = None,
+        # ---- Paths (keep defaults if your structure matches) ----
+        driver_csv: str = "data/sw_celestrack_1957.csv",
+        ic_table_csv: str = "data/IC_Table_modified.csv",
 
-        stats_ts_path: str = None,
-        stats_cae_path: str = None,
+        # IMPORTANT: this MUST match your training feature set
+        stats_ts_path: str = "data/stats_ts.pt",
+        stats_cae_path: str = "data/stats_cae.pt",
 
-        coae_config_yaml: str = None,
-        coae_weights_pth: str = None,
+        coae_config_yaml: str = "weights/finetuned_coae/config.yaml",
+        coae_weights_pth: str = "weights/finetuned_coae/best_weights_1gpu.pth",
 
-        lstm_dir: str = None,
-        gru_dir: str = None,
-        transformer_dir: str = None,
-        meta_model_path: str = None,
+        lstm_dir: str = "Models/Storms/LSTM MODELS",
+        gru_dir: str = "Models/Storms/GRU MODELS",
+        transformer_dir: str = "Models/Storms/TRANSFORMER MODELS",
+        meta_model_path: str = "Meta Models/MetaStormTunedBLa0.keras",
 
-        use_xla: bool = False,
+        # --- behavior ---
+        use_xla: bool = False,   # set True only if you want XLA. False reduces compile spam.
     ):
-
-        base = os.getcwd()   # or project root if you define one
-
-        self.driver_csv = driver_csv or os.path.join(base, "data", "sw_celestrack_1957.csv")
-        self.ic_table_csv = ic_table_csv or os.path.join(base, "data", "IC_Table_modified.csv")
-
-        self.stats_ts_path = stats_ts_path or os.path.join(base, "data", "stats_ts.pt")
-        self.stats_cae_path = stats_cae_path or os.path.join(base, "data", "stats_cae.pt")
-
-        self.coae_config_yaml = coae_config_yaml or os.path.join(
-            base, "weights", "finetuned_coae", "config.yaml"
-        )
-        self.coae_weights_pth = coae_weights_pth or os.path.join(
-            base, "weights", "finetuned_coae", "best_weights_1gpu.pth"
-        )
-
-        self.lstm_dir = lstm_dir or os.path.join(base, "Models", "Storms", "LSTM MODELS")
-        self.gru_dir = gru_dir or os.path.join(base, "Models", "Storms", "GRU MODELS")
-        self.transformer_dir = transformer_dir or os.path.join(base, "Models", "Storms", "TRANSFORMER MODELS")
-
-        self.meta_model_path = meta_model_path or os.path.join(
-            base, "Meta Models", "MetaStormTunedBLa0.keras"
-        )
-
-        self.device = device
-        self.use_xla = use_xla
-
         self.device = _safe_device(device)
 
         # NOTE: horizon is no longer stored in cfg; it is passed to run()
@@ -576,27 +547,54 @@ class ROPE:
 
 
 
+        # if uncertainty:
+        #     decoded_all = []
+        #     for i in range(base_latents_norm.shape[0]):
+        #         lat_phys_pred = self.normalizer.denorm_latents(base_latents_norm[i]).astype(np.float32)  # (H-1,K)
+        #         lat_phys_full = np.vstack([init_lat_phys[None, :], lat_phys_pred])                       # (H,K)
+        #         dens = self.decoder.decode(lat_phys_full)                                                # (H,72,36,45)
+        #         decoded_all.append(dens)
+        
+        #     # Stack ensemble: (M, H, 72, 36, 45)
+        #     decoded_all = np.stack(decoded_all, axis=0).astype(np.float32)
+        #     # out["decoded_all"] = decoded_all
+        
+        #     # Meta-model output is your best estimate (mean)
+        #     meta_density = out["meta_density"].astype(np.float32)  # (H,72,36,45)
+        #     # out["density_mean"] = meta_density
+        
+        #     # Ensemble uncertainty around meta-model
+        #     out["density_std"] = np.sqrt(
+        #         np.mean((decoded_all - meta_density[None, ...])**2, axis=0
+        #                )
+        #     ).astype(np.float32)
+
         if uncertainty:
-            decoded_all = []
-            for i in range(base_latents_norm.shape[0]):
-                lat_phys_pred = self.normalizer.denorm_latents(base_latents_norm[i]).astype(np.float32)  # (H-1,K)
-                lat_phys_full = np.vstack([init_lat_phys[None, :], lat_phys_pred])                       # (H,K)
-                dens = self.decoder.decode(lat_phys_full)                                                # (H,72,36,45)
-                decoded_all.append(dens)
+            M = base_latents_norm.shape[0]
+            K = self.cfg.latent_dim
         
-            # Stack ensemble: (M, H, 72, 36, 45)
-            decoded_all = np.stack(decoded_all, axis=0).astype(np.float32)
-            # out["decoded_all"] = decoded_all
+            # 1) denorm ALL base latents in one shot: (M, H-1, K) -> physical
+            base_latents_phys = self.normalizer.denorm_latents(
+                base_latents_norm.reshape(-1, K)
+            ).astype(np.float32).reshape(M, H - 1, K)
         
-            # Meta-model output is your best estimate (mean)
+            # 2) prepend t0 latent to each model to make (M, H, K)
+            init_rep = np.repeat(init_lat_phys[None, None, :], repeats=M, axis=0)  # (M,1,K)
+            lat_full_all = np.concatenate([init_rep, base_latents_phys], axis=1)   # (M,H,K)
+        
+            # 3) decode everything in ONE decoder pass: (M*H, K) -> (M*H,72,36,45)
+            lat_flat = lat_full_all.reshape(M * H, K)
+            dens_flat = self.decoder.decode(lat_flat)  # (M*H,72,36,45)
+        
+            # 4) reshape back to ensemble: (M,H,72,36,45)
+            decoded_all = dens_flat.reshape(M, H, *dens_flat.shape[1:]).astype(np.float32)
+        
+            # 5) uncertainty around meta density
             meta_density = out["meta_density"].astype(np.float32)  # (H,72,36,45)
-            # out["density_mean"] = meta_density
-        
-            # Ensemble uncertainty around meta-model
             out["density_std"] = np.sqrt(
-                np.mean((decoded_all - meta_density[None, ...])**2, axis=0
-                       )
+                np.mean((decoded_all - meta_density[None, ...]) ** 2, axis=0)
             ).astype(np.float32)
+
     
 
         return out

@@ -85,7 +85,7 @@ Input data including:
 
 ---
 
-## 🧠 Core Python Modules
+##  Core Python Modules
 
 ### `rope.py`
 Main ROPE pipeline.

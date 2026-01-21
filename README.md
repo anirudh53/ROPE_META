@@ -45,7 +45,7 @@ Configuration files for model architectures, hyperparameters, and experiment set
 ### `Models/`
 Trained latent-space forecasting models (LSTM, GRU, Transformer, etc.).
 
-#  Pretrained Models & Weights (External)
+#### Pretrained Models & Weights (External)
 
 Due to GitHub file size limitations, all trained models and large weight files are hosted on Google Drive.
 

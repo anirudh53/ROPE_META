@@ -281,7 +281,8 @@ class DynamicRollout:
             if (t + 1) < horizon:
                 inp[0, :-1] = inp[0, 1:]
                 inp[0, -1, : self.K] = p[0]
-                inp[0, -1, self.K :] = x_chunk_np[t + 1, 2, self.K :]
+                inp[0, -1, self.K :] = x_chunk_np[t + 1, -1, self.K:]
+
 
         return preds
 
@@ -346,7 +347,7 @@ class LatentDecoder:
 class ROPE:
     """
     Usage:
-      from rope1 import ROPE
+      from rope import ROPE
       rope = ROPE(device="cuda")                # loads everything once
       res  = rope.run("2024-02-09 00:00:00", horizon=120)
     """
@@ -484,7 +485,7 @@ class ROPE:
         start_datetime,
         horizon: int = 120,                       
         driver_df: Optional[pd.DataFrame] = None,
-        decode_all: bool = False,
+        uncertainty: bool = True,
     ) -> Dict[str, Any]:
 
         H = int(horizon)
@@ -535,13 +536,38 @@ class ROPE:
             "meta_density": meta_density,                                # (H,72,36,45)
         }
 
-        if decode_all:
+        # if decode_all:
+        #     decoded_all = []
+        #     for i in range(base_latents_norm.shape[0]):
+        #         lat_phys_pred = self.normalizer.denorm_latents(base_latents_norm[i]).astype(np.float32)  # (H-1,K)
+        #         lat_phys_full = np.vstack([init_lat_phys[None, :], lat_phys_pred])                       # (H,K)
+        #         dens = self.decoder.decode(lat_phys_full)
+        #         decoded_all.append(dens)
+        #     out["decoded_all"] = np.stack(decoded_all, axis=0)  # (M,H,72,36,45)
+
+
+
+        if uncertainty:
             decoded_all = []
             for i in range(base_latents_norm.shape[0]):
                 lat_phys_pred = self.normalizer.denorm_latents(base_latents_norm[i]).astype(np.float32)  # (H-1,K)
                 lat_phys_full = np.vstack([init_lat_phys[None, :], lat_phys_pred])                       # (H,K)
-                dens = self.decoder.decode(lat_phys_full)
+                dens = self.decoder.decode(lat_phys_full)                                                # (H,72,36,45)
                 decoded_all.append(dens)
-            out["decoded_all"] = np.stack(decoded_all, axis=0)  # (M,H,72,36,45)
+        
+            # Stack ensemble: (M, H, 72, 36, 45)
+            decoded_all = np.stack(decoded_all, axis=0).astype(np.float32)
+            # out["decoded_all"] = decoded_all
+        
+            # Meta-model output is your best estimate (mean)
+            meta_density = out["meta_density"].astype(np.float32)  # (H,72,36,45)
+            # out["density_mean"] = meta_density
+        
+            # Ensemble uncertainty around meta-model
+            out["density_std"] = np.sqrt(
+                np.mean((decoded_all - meta_density[None, ...])**2, axis=0
+                       )
+            ).astype(np.float32)
+    
 
         return out

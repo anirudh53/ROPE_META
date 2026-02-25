@@ -24,6 +24,7 @@ from ts_utils.custom_layers import PositionalEncoding
 from ae_utils import utils as utils_cae
 from ae_utils.attn_models import COAE
 
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================
 # Optional: reduce TensorFlow log spam
@@ -357,20 +358,22 @@ class ROPE:
         device: str = "cuda",
 
         # ---- Paths (keep defaults if your structure matches) ----
-        driver_csv: str = "data/sw_celestrack_1957.csv",
-        ic_table_csv: str = "data/IC_Table_modified.csv",
-
+        
+        driver_csv: str = os.path.join(THIS_DIR, "data", "sw_celestrack_1957.csv"),
+        ic_table_csv: str = os.path.join(THIS_DIR, "data", "IC_Table_modified.csv"),
+        
         # IMPORTANT: this MUST match your training feature set
-        stats_ts_path: str = "data/stats_ts.pt",
-        stats_cae_path: str = "data/stats_cae.pt",
-
-        coae_config_yaml: str = "weights/finetuned_coae/config.yaml",
-        coae_weights_pth: str = "weights/finetuned_coae/best_weights_1gpu.pth",
-
-        lstm_dir: str = "Models/Storms/LSTM MODELS",
-        gru_dir: str = "Models/Storms/GRU MODELS",
-        transformer_dir: str = "Models/Storms/TRANSFORMER MODELS",
-        meta_model_path: str = "Meta Models/MetaStormTunedBLa0.keras",
+        stats_ts_path: str = os.path.join(THIS_DIR, "data", "stats_ts.pt"),
+        stats_cae_path: str = os.path.join(THIS_DIR, "data", "stats_cae.pt"),
+        
+        coae_config_yaml: str = os.path.join(THIS_DIR, "weights", "finetuned_coae", "config.yaml"),
+        coae_weights_pth: str = os.path.join(THIS_DIR, "weights", "finetuned_coae", "best_weights_1gpu.pth"),
+        
+        lstm_dir: str = os.path.join(THIS_DIR, "Models", "Storms", "LSTM MODELS"),
+        gru_dir: str = os.path.join(THIS_DIR, "Models", "Storms", "GRU MODELS"),
+        transformer_dir: str = os.path.join(THIS_DIR, "Models", "Storms", "TRANSFORMER MODELS"),
+        
+        meta_model_path: str = os.path.join(THIS_DIR, "Meta Models", "MetaStormTunedBLa0.keras"),
 
         # --- behavior ---
         use_xla: bool = False,   # set True only if you want XLA. False reduces compile spam.
@@ -536,65 +539,96 @@ class ROPE:
             "meta_density": meta_density,                                # (H,72,36,45)
         }
 
-        # if decode_all:
-        #     decoded_all = []
-        #     for i in range(base_latents_norm.shape[0]):
-        #         lat_phys_pred = self.normalizer.denorm_latents(base_latents_norm[i]).astype(np.float32)  # (H-1,K)
-        #         lat_phys_full = np.vstack([init_lat_phys[None, :], lat_phys_pred])                       # (H,K)
-        #         dens = self.decoder.decode(lat_phys_full)
-        #         decoded_all.append(dens)
-        #     out["decoded_all"] = np.stack(decoded_all, axis=0)  # (M,H,72,36,45)
-
-
-
-        # if uncertainty:
-        #     decoded_all = []
-        #     for i in range(base_latents_norm.shape[0]):
-        #         lat_phys_pred = self.normalizer.denorm_latents(base_latents_norm[i]).astype(np.float32)  # (H-1,K)
-        #         lat_phys_full = np.vstack([init_lat_phys[None, :], lat_phys_pred])                       # (H,K)
-        #         dens = self.decoder.decode(lat_phys_full)                                                # (H,72,36,45)
-        #         decoded_all.append(dens)
-        
-        #     # Stack ensemble: (M, H, 72, 36, 45)
-        #     decoded_all = np.stack(decoded_all, axis=0).astype(np.float32)
-        #     # out["decoded_all"] = decoded_all
-        
-        #     # Meta-model output is your best estimate (mean)
-        #     meta_density = out["meta_density"].astype(np.float32)  # (H,72,36,45)
-        #     # out["density_mean"] = meta_density
-        
-        #     # Ensemble uncertainty around meta-model
-        #     out["density_std"] = np.sqrt(
-        #         np.mean((decoded_all - meta_density[None, ...])**2, axis=0
-        #                )
-        #     ).astype(np.float32)
-
         if uncertainty:
+            # ---------- Unscented Transform in latent space ----------
+            # Uses base-model latent cloud to estimate P(z_t),
+            # then propagates (mu,P) through nonlinear decoder to get
+            # mean/std in density space.
+
             M = base_latents_norm.shape[0]
-            K = self.cfg.latent_dim
-        
+            K = self.cfg.latent_dim  # should be 10 in your case
+
             # 1) denorm ALL base latents in one shot: (M, H-1, K) -> physical
             base_latents_phys = self.normalizer.denorm_latents(
                 base_latents_norm.reshape(-1, K)
             ).astype(np.float32).reshape(M, H - 1, K)
-        
+
             # 2) prepend t0 latent to each model to make (M, H, K)
             init_rep = np.repeat(init_lat_phys[None, None, :], repeats=M, axis=0)  # (M,1,K)
             lat_full_all = np.concatenate([init_rep, base_latents_phys], axis=1)   # (M,H,K)
-        
-            # 3) decode everything in ONE decoder pass: (M*H, K) -> (M*H,72,36,45)
-            lat_flat = lat_full_all.reshape(M * H, K)
-            dens_flat = self.decoder.decode(lat_flat)  # (M*H,72,36,45)
-        
-            # 4) reshape back to ensemble: (M,H,72,36,45)
-            decoded_all = dens_flat.reshape(M, H, *dens_flat.shape[1:]).astype(np.float32)
-        
-            # 5) uncertainty around meta density
-            meta_density = out["meta_density"].astype(np.float32)  # (H,72,36,45)
-            out["density_std"] = np.sqrt(
-                np.mean((decoded_all - meta_density[None, ...]) ** 2, axis=0)
-            ).astype(np.float32)
 
-    
+            # Mean latent to center sigma points around:
+            # Use your meta-model latent mean (already computed earlier as meta_latents_full).
+            # If meta_latents_full exists in scope, use it; else fallback to sample mean.
+            try:
+                mu_lat = meta_latents_full.astype(np.float32)  # (H,K)
+            except NameError:
+                mu_lat = np.mean(lat_full_all, axis=0).astype(np.float32)  # (H,K)
+
+            # UT hyperparams (standard defaults)
+            alpha = 1
+            beta = 2.0
+            kappa = 0.0
+            lam = (alpha ** 2) * (K + kappa) - K
+            c = K + lam
+
+            # UT weights
+            Wm = np.full(2 * K + 1, 1.0 / (2.0 * c), dtype=np.float32)
+            Wc = np.full(2 * K + 1, 1.0 / (2.0 * c), dtype=np.float32)
+            Wm[0] = lam / c
+            Wc[0] = lam / c + (1.0 - alpha ** 2 + beta)
+
+            # Build sigma points for every time t
+            # sigma_lat: (H, 2K+1, K)
+            sigma_lat = np.zeros((H, 2 * K + 1, K), dtype=np.float32)
+            sigma_lat[:, 0, :] = mu_lat
+
+            # covariance per time (H,K,K) from base-model latent cloud
+            # Use unbiased sample covariance
+            eps = 1e-6  # jitter for numerical stability
+            for t in range(H):
+                Xt = lat_full_all[:, t, :].astype(np.float32)    # (M,K)
+                mt = mu_lat[t].astype(np.float32)                # (K,)
+
+                d = Xt - mt[None, :]
+                if M > 1:
+                    Pt = (d.T @ d) / float(M - 1)               # (K,K)
+                else:
+                    Pt = np.zeros((K, K), dtype=np.float32)
+
+                # Stabilize covariance (SPD) for Cholesky
+                Pt = 0.5 * (Pt + Pt.T)
+                Pt = Pt + (eps * np.eye(K, dtype=np.float32))
+
+                # Cholesky of c*P
+                try:
+                    S = np.linalg.cholesky(c * Pt).astype(np.float32)  # (K,K)
+                except np.linalg.LinAlgError:
+                    # fallback: stronger jitter
+                    Pt = Pt + (1e-3 * np.eye(K, dtype=np.float32))
+                    S = np.linalg.cholesky(c * Pt).astype(np.float32)
+
+                for i in range(K):
+                    sigma_lat[t, 1 + i, :] = mt + S[:, i]
+                    sigma_lat[t, 1 + K + i, :] = mt - S[:, i]
+
+            # Decode ALL sigma points in ONE pass:
+            # (H*(2K+1), K) -> (H*(2K+1),72,36,45)
+            lat_flat = sigma_lat.reshape(H * (2 * K + 1), K)
+            dens_flat = self.decoder.decode(lat_flat)  # (H*(2K+1),72,36,45)
+            dens_sigmas = dens_flat.reshape(H, 2 * K + 1, *dens_flat.shape[1:]).astype(np.float32)
+
+            # UT mean & variance in density space
+            # mean: (H,72,36,45)
+            ut_mean = np.tensordot(Wm, dens_sigmas, axes=(0, 1)).astype(np.float32)
+
+            # var: E[(x-mean)^2] with UT covariance weights
+            diff = dens_sigmas - ut_mean[:, None, ...]
+            ut_var = np.tensordot(Wc, diff * diff, axes=(0, 1)).astype(np.float32)
+
+            out["meta_density"] = ut_mean
+            out["density_std"] = np.sqrt(np.maximum(ut_var, 0.0)).astype(np.float32)
+
+
 
         return out

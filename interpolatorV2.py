@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Any, Union, Optional
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,7 @@ class TimeOutOfRangeError(ValueError):
 
 
 class SpatialOutOfRangeError(ValueError):
+    """Kept for backward compatibility; this interpolator now WARNs (does not raise) on spatial OOB."""
     pass
 
 
@@ -46,13 +48,16 @@ class DensityInterpolator:
       - "hold_next_hour": use next model hour (ceil), no time interpolation
       - "interp_time": linear interpolation between bracketing snapshots
 
-    Altitude handling:
-      - alt_km <= 980    : standard RegularGridInterpolator (within grid)
-      - 980 < alt_km <= 2000 : exponential extrapolation using top two grid levels
-                               rho(z) = rho_980 * exp(-(z - 980) / H)
-                               where H is derived locally from the ratio of the
-                               top two grid levels at that (lst, lat) point.
-      - alt_km > 2000    : returns 0.0 immediately
+    Spatial out-of-bounds handling (UPDATED):
+      - LST/lat below/above grid, or alt below grid minimum:
+          -> emits a warning, returns 0.0 (and sigma=0.0 if available)
+      - alt > 2000 km:
+          -> emits a warning, returns 0.0 immediately
+
+    Altitude handling (when spatially in-bounds for LST/lat and alt >= alt_min):
+      - alt_km <= 980          : standard RegularGridInterpolator (within grid)
+      - 980 < alt_km <= 2000   : exponential extrapolation using top two grid levels
+      - alt_km > 2000          : returns 0.0 immediately
     """
 
     # Hard ceiling above which density is treated as zero
@@ -62,7 +67,6 @@ class DensityInterpolator:
         self,
         res: Dict[str, Any],
         axes: Optional[GridAxes] = None,
-        bounds_error: bool = False,
         fill_value: float = np.nan,
     ):
         if "window_df" not in res or "datetime" not in res["window_df"].columns:
@@ -96,7 +100,6 @@ class DensityInterpolator:
                 )
 
         self.axes = axes if axes is not None else default_axes()
-        self.bounds_error = bool(bounds_error)
         self.fill_value = fill_value
 
         # Spatial bounds (grid limits)
@@ -120,7 +123,7 @@ class DensityInterpolator:
             "lat_min": self._lat_min,
             "lat_max": self._lat_max,
             "alt_km_min": self._alt_min,
-            "alt_km_max": self._alt_max,       # 2000 km (hard zero above this)
+            "alt_km_max": self._alt_max,            # 2000 km (hard zero above this)
             "alt_km_grid_top": self._alt_grid_top,  # 980 km (top of interpolation grid)
             "time_min": self._t_min,
             "time_max": self._t_max,
@@ -128,29 +131,39 @@ class DensityInterpolator:
 
     # ---------- helpers ----------
 
-    def _validate_spatial(self, lst: float, lat: float, alt_km: float) -> None:
+    def _spatial_oob_warning(self, msg: str) -> None:
+        warnings.warn(msg, category=RuntimeWarning, stacklevel=3)
+
+    def _spatial_is_in_bounds(self, lst: float, lat: float, alt_km: float) -> bool:
         """
-        Raise SpatialOutOfRangeError for LST/lat out of bounds.
-        Altitude above the grid top (980 km) is handled by extrapolation,
-        not by raising an error, unless alt_km exceeds the hard ceiling (2000 km)
-        AND bounds_error=True.
+        Returns True if spatial inputs are in supported bounds for normal handling.
+        If out-of-bounds, emits a warning and returns False (caller should return 0s).
         """
         if not (self._lst_min <= lst <= self._lst_max):
-            raise SpatialOutOfRangeError(
-                f"LST out of bounds: {lst} not in [{self._lst_min}, {self._lst_max}]"
+            self._spatial_oob_warning(
+                f"[DensityInterpolator] LST out of bounds ({lst}); expected [{self._lst_min}, {self._lst_max}]. Returning 0."
             )
+            return False
+
         if not (self._lat_min <= lat <= self._lat_max):
-            raise SpatialOutOfRangeError(
-                f"lat out of bounds: {lat} not in [{self._lat_min}, {self._lat_max}]"
+            self._spatial_oob_warning(
+                f"[DensityInterpolator] lat out of bounds ({lat}); expected [{self._lat_min}, {self._lat_max}]. Returning 0."
             )
-        if self.bounds_error and alt_km > self.ALT_HARD_ZERO_KM:
-            raise SpatialOutOfRangeError(
-                f"alt_km {alt_km} exceeds hard-zero ceiling {self.ALT_HARD_ZERO_KM} km"
-            )
+            return False
+
         if alt_km < self._alt_min:
-            raise SpatialOutOfRangeError(
-                f"alt_km out of bounds: {alt_km} below grid minimum {self._alt_min} km"
+            self._spatial_oob_warning(
+                f"[DensityInterpolator] alt_km below grid minimum ({alt_km} < {self._alt_min}). Returning 0."
             )
+            return False
+
+        if alt_km > self.ALT_HARD_ZERO_KM:
+            self._spatial_oob_warning(
+                f"[DensityInterpolator] alt_km exceeds hard-zero ceiling ({alt_km} > {self.ALT_HARD_ZERO_KM}). Returning 0."
+            )
+            return False
+
+        return True
 
     def _point(self, lst: float, lat: float, alt_km: float) -> np.ndarray:
         return np.array([[float(lst), float(lat), float(alt_km)]], dtype=np.float64)
@@ -160,15 +173,13 @@ class DensityInterpolator:
         return RegularGridInterpolator(
             (self.axes.lst_axis, self.axes.lat_axis, self.axes.alt_axis),
             field_t,
-            bounds_error=False,      # always False here; we handle bounds ourselves
+            bounds_error=False,
             fill_value=self.fill_value,
         )
 
     def _spatial_value(self, field_t: np.ndarray, point: np.ndarray) -> float:
         """
         Return the spatially interpolated (or extrapolated) value at *point*.
-
-        point shape: (1, 3) — [lst, lat, alt_km]
 
         Altitude regime logic
         ---------------------
@@ -178,18 +189,17 @@ class DensityInterpolator:
         """
         alt_km = float(point[0, 2])
 
-        # ── Hard zero above 2000 km ──────────────────────────────────────────
+        # Hard zero above 2000 km (query() also warns/short-circuits earlier)
         if alt_km > self.ALT_HARD_ZERO_KM:
             return 0.0
 
         f = self._make_interpolator(field_t)
 
-        # ── Within grid (alt <= 980 km) ──────────────────────────────────────
+        # Within grid
         if alt_km <= self._alt_grid_top:
             return float(f(point)[0])
 
-        # ── Exponential tail (980 < alt <= 2000 km) ──────────────────────────
-        # Query density at the two topmost grid levels at the same (lst, lat).
+        # Exponential tail (980 < alt <= 2000)
         lst, lat = float(point[0, 0]), float(point[0, 1])
 
         pt_top1 = np.array([[lst, lat, self._tail_z1]])   # 980 km
@@ -198,17 +208,13 @@ class DensityInterpolator:
         rho1 = float(f(pt_top1)[0])   # density at 980 km
         rho0 = float(f(pt_top0)[0])   # density at level below 980 km
 
-        # Derive scale height H from the two anchor points:
-        #   rho(z) = rho1 * exp(-(z - z1) / H)
-        #   => H = dz / ln(rho0 / rho1)
-        dz = self._tail_z1 - self._tail_z0   # always positive (e.g. ~20 km)
+        dz = self._tail_z1 - self._tail_z0
 
         if rho0 > 0.0 and rho1 > 0.0:
             log_ratio = np.log(rho0 / rho1)
-            # Clamp H: guard against zero/negative log_ratio (density inversion)
             H = dz / log_ratio if log_ratio > 1e-30 else 100.0
         else:
-            H = 100.0   # fallback scale height [km]
+            H = 100.0
 
         extrapolated = rho1 * np.exp(-(alt_km - self._tail_z1) / H)
         return float(extrapolated)
@@ -232,21 +238,6 @@ class DensityInterpolator:
         Return density at (when, lst, lat, alt_km).
 
         If density_std exists in res, ALSO returns "sigma".
-
-        Parameters
-        ----------
-        when      : timestamp (string or pd.Timestamp)
-        lst       : local solar time [0, 23.67]
-        lat       : geodetic latitude [-87.5, 87.5]
-        alt_km    : altitude in km
-                      <= 980       → grid interpolation
-                      (980, 2000]  → exponential extrapolation
-                      > 2000       → density = 0.0
-        time_mode : "hold_next_hour" | "interp_time"
-
-        Returns
-        -------
-        dict with at minimum "density" key; see below for full key list.
         """
         when = pd.to_datetime(when)
 
@@ -258,8 +249,12 @@ class DensityInterpolator:
                 f"Requested time {when} outside [{self._t_min}, {self._t_max}]"
             )
 
-        self._validate_spatial(float(lst), float(lat), float(alt_km))
-        point = self._point(lst, lat, alt_km)
+        lst_f, lat_f, alt_f = float(lst), float(lat), float(alt_km)
+
+        # Spatial OOB -> warn + return 0 (keep time behavior/metadata consistent)
+        spatial_ok = self._spatial_is_in_bounds(lst_f, lat_f, alt_f)
+
+        point = self._point(lst_f, lat_f, alt_f)
 
         i0, i1 = self._bracket_indices(when)
         t0, t1 = self.times.iloc[i0], self.times.iloc[i1]
@@ -267,6 +262,20 @@ class DensityInterpolator:
         # ── hold_next_hour ────────────────────────────────────────────────────
         if time_mode == "hold_next_hour":
             use_i = i0 if when == t0 else i1
+
+            if not spatial_ok:
+                out = {
+                    "datetime_requested": when,
+                    "datetime_used": self.times.iloc[use_i],
+                    "density": 0.0,
+                    "t_index": int(use_i),
+                    "time_mode": "hold_next_hour",
+                    "alt_regime": self._alt_regime(alt_f),
+                    "spatial_oob": True,
+                }
+                if self.sigma is not None:
+                    out["sigma"] = 0.0
+                return out
 
             dens_val = self._spatial_value(self.dens[use_i], point)
 
@@ -276,7 +285,7 @@ class DensityInterpolator:
                 "density": float(dens_val),
                 "t_index": int(use_i),
                 "time_mode": "hold_next_hour",
-                "alt_regime": self._alt_regime(float(alt_km)),
+                "alt_regime": self._alt_regime(alt_f),
             }
 
             if self.sigma is not None:
@@ -287,6 +296,23 @@ class DensityInterpolator:
 
         # ── interp_time ───────────────────────────────────────────────────────
         w = float((when - t0) / (t1 - t0))   # 0 .. 1
+
+        if not spatial_ok:
+            out = {
+                "datetime": when,
+                "density": 0.0,
+                "t_index_left": int(i0),
+                "t_index_right": int(i1),
+                "datetime_left": t0,
+                "datetime_right": t1,
+                "time_weight_right": w,
+                "time_mode": "interp_time",
+                "alt_regime": self._alt_regime(alt_f),
+                "spatial_oob": True,
+            }
+            if self.sigma is not None:
+                out["sigma"] = 0.0
+            return out
 
         d0 = self._spatial_value(self.dens[i0], point)
         d1 = self._spatial_value(self.dens[i1], point)
@@ -301,7 +327,7 @@ class DensityInterpolator:
             "datetime_right": t1,
             "time_weight_right": w,
             "time_mode": "interp_time",
-            "alt_regime": self._alt_regime(float(alt_km)),
+            "alt_regime": self._alt_regime(alt_f),
         }
 
         if self.sigma is not None:
@@ -315,7 +341,6 @@ class DensityInterpolator:
     # ---------- utility ----------
 
     def _alt_regime(self, alt_km: float) -> str:
-        """Human-readable label for the altitude handling regime used."""
         if alt_km > self.ALT_HARD_ZERO_KM:
             return "hard_zero"
         if alt_km > self._alt_grid_top:

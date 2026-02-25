@@ -24,7 +24,7 @@ from ts_utils.custom_layers import PositionalEncoding
 from ae_utils import utils as utils_cae
 from ae_utils.attn_models import COAE
 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================
 # Optional: reduce TensorFlow log spam
@@ -359,21 +359,21 @@ class ROPE:
 
         # ---- Paths (keep defaults if your structure matches) ----
         
-        driver_csv: str = os.path.join(THIS_DIR, "data", "sw_celestrack_1957.csv"),
-        ic_table_csv: str = os.path.join(THIS_DIR, "data", "IC_Table_modified.csv"),
+        driver_csv: str = os.path.join( "data", "sw_celestrack_1957.csv"),
+        ic_table_csv: str = os.path.join("data", "IC_Table_modified.csv"),
         
         # IMPORTANT: this MUST match your training feature set
-        stats_ts_path: str = os.path.join(THIS_DIR, "data", "stats_ts.pt"),
-        stats_cae_path: str = os.path.join(THIS_DIR, "data", "stats_cae.pt"),
+        stats_ts_path: str = os.path.join("data", "stats_ts.pt"),
+        stats_cae_path: str = os.path.join("data", "stats_cae.pt"),
         
-        coae_config_yaml: str = os.path.join(THIS_DIR, "weights", "finetuned_coae", "config.yaml"),
-        coae_weights_pth: str = os.path.join(THIS_DIR, "weights", "finetuned_coae", "best_weights_1gpu.pth"),
+        coae_config_yaml: str = os.path.join("weights", "finetuned_coae", "config.yaml"),
+        coae_weights_pth: str = os.path.join("weights", "finetuned_coae", "best_weights_1gpu.pth"),
         
-        lstm_dir: str = os.path.join(THIS_DIR, "Models", "Storms", "LSTM MODELS"),
-        gru_dir: str = os.path.join(THIS_DIR, "Models", "Storms", "GRU MODELS"),
-        transformer_dir: str = os.path.join(THIS_DIR, "Models", "Storms", "TRANSFORMER MODELS"),
+        lstm_dir: str = os.path.join("Models", "Storms", "LSTM MODELS"),
+        gru_dir: str = os.path.join("Models", "Storms", "GRU MODELS"),
+        transformer_dir: str = os.path.join("Models", "Storms", "TRANSFORMER MODELS"),
         
-        meta_model_path: str = os.path.join(THIS_DIR, "Meta Models", "MetaStormTunedBLa0.keras"),
+        meta_model_path: str = os.path.join("Meta Models", "MetaStormTunedBLa0.keras"),
 
         # --- behavior ---
         use_xla: bool = False,   # set True only if you want XLA. False reduces compile spam.

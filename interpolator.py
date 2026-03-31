@@ -49,19 +49,23 @@ class DensityInterpolator:
       - "interp_time": linear interpolation between bracketing snapshots
 
     Spatial out-of-bounds handling (UPDATED):
-      - LST/lat below/above grid, or alt below grid minimum:
+      - LST is treated as CYCLIC with period 24 hr:
+          -> lst = 24.0  behaves like 0.0
+          -> lst = 23.8  interpolates across the seam with wrapped 0.0
+          -> lst = -0.2  behaves like 23.8
+      - lat below/above grid, or alt below grid minimum:
           -> emits a warning, returns 0.0 (and sigma=0.0 if available)
       - alt > 2000 km:
           -> emits a warning, returns 0.0 immediately
 
-    Altitude handling (when spatially in-bounds for LST/lat and alt >= alt_min):
+    Altitude handling (when spatially in-bounds for lat and alt >= alt_min):
       - alt_km <= 980          : standard RegularGridInterpolator (within grid)
       - 980 < alt_km <= 2000   : exponential extrapolation using top two grid levels
       - alt_km > 2000          : returns 0.0 immediately
     """
 
-    # Hard ceiling above which density is treated as zero
     ALT_HARD_ZERO_KM: float = 2000.0
+    LST_PERIOD_HR: float = 24.0
 
     def __init__(
         self,
@@ -72,7 +76,6 @@ class DensityInterpolator:
         if "window_df" not in res or "datetime" not in res["window_df"].columns:
             raise KeyError("res must contain 'window_df' with a 'datetime' column")
 
-        # Prefer density_mean if present, else meta_density
         if "density_mean" in res:
             self.dens = np.asarray(res["density_mean"])
         else:
@@ -90,7 +93,6 @@ class DensityInterpolator:
                 f"Time alignment mismatch: len(window_df)={len(self.times)} vs density T={self.dens.shape[0]}"
             )
 
-        # Optional sigma field
         self.sigma = None
         if "density_std" in res:
             self.sigma = np.asarray(res["density_std"])
@@ -102,19 +104,22 @@ class DensityInterpolator:
         self.axes = axes if axes is not None else default_axes()
         self.fill_value = fill_value
 
-        # Spatial bounds (grid limits)
-        self._lst_min, self._lst_max = float(self.axes.lst_axis.min()), float(self.axes.lst_axis.max())
-        self._lat_min, self._lat_max = float(self.axes.lat_axis.min()), float(self.axes.lat_axis.max())
+        self._lst_min = float(self.axes.lst_axis.min())
+        self._lst_max = float(self.axes.lst_axis.max())
+        self._lat_min = float(self.axes.lat_axis.min())
+        self._lat_max = float(self.axes.lat_axis.max())
         self._alt_min = float(self.axes.alt_axis.min())
-        self._alt_grid_top = float(self.axes.alt_axis.max())   # 980 km — top of grid
-        self._alt_max = self.ALT_HARD_ZERO_KM                  # 2000 km — reported upper bound
+        self._alt_grid_top = float(self.axes.alt_axis.max())
+        self._alt_max = self.ALT_HARD_ZERO_KM
 
-        # The two topmost altitude levels, used for exponential tail fit
-        self._tail_z0 = float(self.axes.alt_axis[-2])   # second-to-last (e.g. ~960 km)
-        self._tail_z1 = float(self.axes.alt_axis[-1])   # last level     (e.g. 980 km)
+        self._tail_z0 = float(self.axes.alt_axis[-2])
+        self._tail_z1 = float(self.axes.alt_axis[-1])
 
         self._t_min = self.times.iloc[0]
         self._t_max = self.times.iloc[-1]
+
+        # Extend cyclic LST axis with 24.0, and later repeat first slice at end.
+        self._lst_axis_ext = np.append(self.axes.lst_axis, self.LST_PERIOD_HR)
 
     def bounds(self) -> Dict[str, float]:
         return {
@@ -123,8 +128,8 @@ class DensityInterpolator:
             "lat_min": self._lat_min,
             "lat_max": self._lat_max,
             "alt_km_min": self._alt_min,
-            "alt_km_max": self._alt_max,            # 2000 km (hard zero above this)
-            "alt_km_grid_top": self._alt_grid_top,  # 980 km (top of interpolation grid)
+            "alt_km_max": self._alt_max,
+            "alt_km_grid_top": self._alt_grid_top,
             "time_min": self._t_min,
             "time_max": self._t_max,
         }
@@ -134,14 +139,25 @@ class DensityInterpolator:
     def _spatial_oob_warning(self, msg: str) -> None:
         warnings.warn(msg, category=RuntimeWarning, stacklevel=3)
 
+    def _wrap_lst(self, lst: float) -> float:
+        """
+        Wrap LST into [0, 24).
+        Examples:
+            24.0  -> 0.0
+            23.8  -> 23.8
+            -0.2  -> 23.8
+            48.0  -> 0.0
+        """
+        return float(lst % self.LST_PERIOD_HR)
+
     def _spatial_is_in_bounds(self, lst: float, lat: float, alt_km: float) -> bool:
         """
-        Returns True if spatial inputs are in supported bounds for normal handling.
-        If out-of-bounds, emits a warning and returns False (caller should return 0s).
+        LST is cyclic, so it is always accepted if finite.
+        lat / alt keep the same OOB behavior as before.
         """
-        if not (self._lst_min <= lst <= self._lst_max):
+        if not np.isfinite(lst):
             self._spatial_oob_warning(
-                f"[DensityInterpolator] LST out of bounds ({lst}); expected [{self._lst_min}, {self._lst_max}]. Returning 0."
+                f"[DensityInterpolator] LST is not finite ({lst}). Returning 0."
             )
             return False
 
@@ -166,13 +182,28 @@ class DensityInterpolator:
         return True
 
     def _point(self, lst: float, lat: float, alt_km: float) -> np.ndarray:
-        return np.array([[float(lst), float(lat), float(alt_km)]], dtype=np.float64)
+        lst_wrapped = self._wrap_lst(lst)
+        return np.array([[lst_wrapped, float(lat), float(alt_km)]], dtype=np.float64)
+
+    def _extend_field_cyclic_lst(self, field_t: np.ndarray) -> np.ndarray:
+        """
+        Extend field along LST by appending the first slice at 24.0,
+        so interpolation wraps smoothly across the seam.
+        Input shape:  (72, 36, 45)
+        Output shape: (73, 36, 45)
+        """
+        return np.concatenate([field_t, field_t[0:1, :, :]], axis=0)
 
     def _make_interpolator(self, field_t: np.ndarray) -> RegularGridInterpolator:
-        """Build a spatial interpolator for one time-slice of a field."""
+        """
+        Build a spatial interpolator for one time-slice of a field.
+        Uses cyclic extension in LST.
+        """
+        field_ext = self._extend_field_cyclic_lst(field_t)
+
         return RegularGridInterpolator(
-            (self.axes.lst_axis, self.axes.lat_axis, self.axes.alt_axis),
-            field_t,
+            (self._lst_axis_ext, self.axes.lat_axis, self.axes.alt_axis),
+            field_ext,
             bounds_error=False,
             fill_value=self.fill_value,
         )
@@ -186,27 +217,35 @@ class DensityInterpolator:
         alt <= 980 km          : RegularGridInterpolator (trilinear within grid)
         980 < alt <= 2000 km   : exponential extrapolation anchored at grid top
         alt > 2000 km          : 0.0 (hard zero)
+
+        LST logic
+        ---------
+        LST is cyclic. The interpolator is built on an extended axis:
+            [0, ..., 23.6667, 24.0]
+        where the 24.0 slice is a repeat of the 0.0 slice.
         """
+        lst = float(point[0, 0])
+        lat = float(point[0, 1])
         alt_km = float(point[0, 2])
 
-        # Hard zero above 2000 km (query() also warns/short-circuits earlier)
+        # always wrap before interpolation
+        lst = self._wrap_lst(lst)
+        point_wrapped = np.array([[lst, lat, alt_km]], dtype=np.float64)
+
         if alt_km > self.ALT_HARD_ZERO_KM:
             return 0.0
 
         f = self._make_interpolator(field_t)
 
-        # Within grid
         if alt_km <= self._alt_grid_top:
-            return float(f(point)[0])
+            return float(f(point_wrapped)[0])
 
         # Exponential tail (980 < alt <= 2000)
-        lst, lat = float(point[0, 0]), float(point[0, 1])
+        pt_top1 = np.array([[lst, lat, self._tail_z1]], dtype=np.float64)
+        pt_top0 = np.array([[lst, lat, self._tail_z0]], dtype=np.float64)
 
-        pt_top1 = np.array([[lst, lat, self._tail_z1]])   # 980 km
-        pt_top0 = np.array([[lst, lat, self._tail_z0]])   # ~960 km
-
-        rho1 = float(f(pt_top1)[0])   # density at 980 km
-        rho0 = float(f(pt_top0)[0])   # density at level below 980 km
+        rho1 = float(f(pt_top1)[0])
+        rho0 = float(f(pt_top0)[0])
 
         dz = self._tail_z1 - self._tail_z0
 
@@ -250,10 +289,9 @@ class DensityInterpolator:
             )
 
         lst_f, lat_f, alt_f = float(lst), float(lat), float(alt_km)
+        lst_wrapped = self._wrap_lst(lst_f)
 
-        # Spatial OOB -> warn + return 0 (keep time behavior/metadata consistent)
         spatial_ok = self._spatial_is_in_bounds(lst_f, lat_f, alt_f)
-
         point = self._point(lst_f, lat_f, alt_f)
 
         i0, i1 = self._bracket_indices(when)
@@ -272,6 +310,8 @@ class DensityInterpolator:
                     "time_mode": "hold_next_hour",
                     "alt_regime": self._alt_regime(alt_f),
                     "spatial_oob": True,
+                    "lst_requested": lst_f,
+                    "lst_used_wrapped": lst_wrapped,
                 }
                 if self.sigma is not None:
                     out["sigma"] = 0.0
@@ -286,6 +326,8 @@ class DensityInterpolator:
                 "t_index": int(use_i),
                 "time_mode": "hold_next_hour",
                 "alt_regime": self._alt_regime(alt_f),
+                "lst_requested": lst_f,
+                "lst_used_wrapped": lst_wrapped,
             }
 
             if self.sigma is not None:
@@ -295,7 +337,7 @@ class DensityInterpolator:
             return out
 
         # ── interp_time ───────────────────────────────────────────────────────
-        w = float((when - t0) / (t1 - t0))   # 0 .. 1
+        w = float((when - t0) / (t1 - t0))
 
         if not spatial_ok:
             out = {
@@ -309,6 +351,8 @@ class DensityInterpolator:
                 "time_mode": "interp_time",
                 "alt_regime": self._alt_regime(alt_f),
                 "spatial_oob": True,
+                "lst_requested": lst_f,
+                "lst_used_wrapped": lst_wrapped,
             }
             if self.sigma is not None:
                 out["sigma"] = 0.0
@@ -328,6 +372,8 @@ class DensityInterpolator:
             "time_weight_right": w,
             "time_mode": "interp_time",
             "alt_regime": self._alt_regime(alt_f),
+            "lst_requested": lst_f,
+            "lst_used_wrapped": lst_wrapped,
         }
 
         if self.sigma is not None:

@@ -216,7 +216,7 @@ class DensityInterpolator:
         ---------------------
         alt <= 980 km          : RegularGridInterpolator (trilinear within grid)
         980 < alt <= 2000 km   : exponential extrapolation anchored at grid top
-        alt > 2000 km          : 0.0 (hard zero)
+        alt > 2000 km          : 0.0 (hard zero)  or 1e-16
 
         LST logic
         ---------
@@ -233,7 +233,7 @@ class DensityInterpolator:
         point_wrapped = np.array([[lst, lat, alt_km]], dtype=np.float64)
 
         if alt_km > self.ALT_HARD_ZERO_KM:
-            return 0.0
+            return 1e-16  
 
         f = self._make_interpolator(field_t)
 

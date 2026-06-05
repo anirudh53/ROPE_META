@@ -48,17 +48,22 @@ class DensityInterpolator:
       - "hold_next_hour": use next model hour (ceil), no time interpolation
       - "interp_time": linear interpolation between bracketing snapshots
 
-    Spatial out-of-bounds handling (UPDATED):
+    Spatial out-of-bounds handling:
       - LST is treated as CYCLIC with period 24 hr:
           -> lst = 24.0  behaves like 0.0
           -> lst = 23.8  interpolates across the seam with wrapped 0.0
           -> lst = -0.2  behaves like 23.8
-      - lat below/above grid, or alt below grid minimum:
+      - lat outside [-87.5, 87.5]:
+          -> CLAMPED to nearest pole (±87.5). No warning, no zero return.
+          -> Physically correct: grid ends at ±87.5 due to finite-difference grid,
+             not because density goes to zero there.
+          -> lat_requested and lat_used_clamped are both reported in output.
+      - alt below grid minimum:
           -> emits a warning, returns 0.0 (and sigma=0.0 if available)
       - alt > 2000 km:
           -> emits a warning, returns 0.0 immediately
 
-    Altitude handling (when spatially in-bounds for lat and alt >= alt_min):
+    Altitude handling (when spatially in-bounds for alt >= alt_min):
       - alt_km <= 980          : standard RegularGridInterpolator (within grid)
       - 980 < alt_km <= 2000   : exponential extrapolation using top two grid levels
       - alt_km > 2000          : returns 0.0 immediately
@@ -150,20 +155,23 @@ class DensityInterpolator:
         """
         return float(lst % self.LST_PERIOD_HR)
 
-    def _spatial_is_in_bounds(self, lst: float, lat: float, alt_km: float) -> bool:
+    def _clamp_lat(self, lat: float) -> float:
+        """
+        Clamp latitude to grid bounds [-87.5, 87.5].
+        Nearest-neighbor assumption: the grid ends at ±87.5 due to the
+        finite-difference discretization, not because density vanishes there.
+        """
+        return float(np.clip(lat, self._lat_min, self._lat_max))
+
+    def _spatial_is_in_bounds(self, lst: float, alt_km: float) -> bool:
         """
         LST is cyclic, so it is always accepted if finite.
-        lat / alt keep the same OOB behavior as before.
+        Lat is clamped before reaching here, so no lat check needed.
+        Only alt is checked for hard OOB.
         """
         if not np.isfinite(lst):
             self._spatial_oob_warning(
                 f"[DensityInterpolator] LST is not finite ({lst}). Returning 0."
-            )
-            return False
-
-        if not (self._lat_min <= lat <= self._lat_max):
-            self._spatial_oob_warning(
-                f"[DensityInterpolator] lat out of bounds ({lat}); expected [{self._lat_min}, {self._lat_max}]. Returning 0."
             )
             return False
 
@@ -183,7 +191,8 @@ class DensityInterpolator:
 
     def _point(self, lst: float, lat: float, alt_km: float) -> np.ndarray:
         lst_wrapped = self._wrap_lst(lst)
-        return np.array([[lst_wrapped, float(lat), float(alt_km)]], dtype=np.float64)
+        lat_clamped = self._clamp_lat(lat)
+        return np.array([[lst_wrapped, lat_clamped, float(alt_km)]], dtype=np.float64)
 
     def _extend_field_cyclic_lst(self, field_t: np.ndarray) -> np.ndarray:
         """
@@ -216,13 +225,17 @@ class DensityInterpolator:
         ---------------------
         alt <= 980 km          : RegularGridInterpolator (trilinear within grid)
         980 < alt <= 2000 km   : exponential extrapolation anchored at grid top
-        alt > 2000 km          : 0.0 (hard zero)  or 1e-16
+        alt > 2000 km          : 0.0 (hard zero)
 
         LST logic
         ---------
         LST is cyclic. The interpolator is built on an extended axis:
             [0, ..., 23.6667, 24.0]
         where the 24.0 slice is a repeat of the 0.0 slice.
+
+        Lat logic
+        ---------
+        Lat is already clamped to [-87.5, 87.5] before this is called.
         """
         lst = float(point[0, 0])
         lat = float(point[0, 1])
@@ -233,7 +246,7 @@ class DensityInterpolator:
         point_wrapped = np.array([[lst, lat, alt_km]], dtype=np.float64)
 
         if alt_km > self.ALT_HARD_ZERO_KM:
-            return 1e-16  
+            return 1e-16
 
         f = self._make_interpolator(field_t)
 
@@ -277,6 +290,9 @@ class DensityInterpolator:
         Return density at (when, lst, lat, alt_km).
 
         If density_std exists in res, ALSO returns "sigma".
+
+        lat outside [-87.5, 87.5] is clamped to the nearest pole.
+        lat_requested and lat_used_clamped are always reported in the output dict.
         """
         when = pd.to_datetime(when)
 
@@ -290,9 +306,10 @@ class DensityInterpolator:
 
         lst_f, lat_f, alt_f = float(lst), float(lat), float(alt_km)
         lst_wrapped = self._wrap_lst(lst_f)
+        lat_clamped = self._clamp_lat(lat_f)
 
-        spatial_ok = self._spatial_is_in_bounds(lst_f, lat_f, alt_f)
-        point = self._point(lst_f, lat_f, alt_f)
+        spatial_ok = self._spatial_is_in_bounds(lst_f, alt_f)
+        point = self._point(lst_f, lat_f, alt_f)  # already clamps lat internally
 
         i0, i1 = self._bracket_indices(when)
         t0, t1 = self.times.iloc[i0], self.times.iloc[i1]
@@ -312,6 +329,8 @@ class DensityInterpolator:
                     "spatial_oob": True,
                     "lst_requested": lst_f,
                     "lst_used_wrapped": lst_wrapped,
+                    "lat_requested": lat_f,
+                    "lat_used_clamped": lat_clamped,
                 }
                 if self.sigma is not None:
                     out["sigma"] = 0.0
@@ -328,6 +347,8 @@ class DensityInterpolator:
                 "alt_regime": self._alt_regime(alt_f),
                 "lst_requested": lst_f,
                 "lst_used_wrapped": lst_wrapped,
+                "lat_requested": lat_f,
+                "lat_used_clamped": lat_clamped,
             }
 
             if self.sigma is not None:
@@ -353,6 +374,8 @@ class DensityInterpolator:
                 "spatial_oob": True,
                 "lst_requested": lst_f,
                 "lst_used_wrapped": lst_wrapped,
+                "lat_requested": lat_f,
+                "lat_used_clamped": lat_clamped,
             }
             if self.sigma is not None:
                 out["sigma"] = 0.0
@@ -374,6 +397,8 @@ class DensityInterpolator:
             "alt_regime": self._alt_regime(alt_f),
             "lst_requested": lst_f,
             "lst_used_wrapped": lst_wrapped,
+            "lat_requested": lat_f,
+            "lat_used_clamped": lat_clamped,
         }
 
         if self.sigma is not None:

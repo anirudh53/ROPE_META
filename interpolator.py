@@ -48,15 +48,31 @@ class DensityInterpolator:
       - "hold_next_hour": use next model hour (ceil), no time interpolation
       - "interp_time": linear interpolation between bracketing snapshots
 
+    pole_mode (NEW):
+      - "cap_average" (default): the density field is extended with synthetic
+        pole rows at lat = -90 and lat = +90, each equal to the LST-average of
+        the nearest real ring (lat = -87.5 / lat = +87.5). Latitude is then
+        linearly interpolated between 87.5 and 90 toward this LST-independent
+        pole value. This removes both the spurious LST-dependence and the
+        gradient discontinuity that flat clamping introduces near the poles.
+        Valid input lat range becomes [-90, 90]; values are clamped to it.
+      - "clamp" (legacy): flat-clamps lat to [-87.5, 87.5], i.e. the original
+        behavior. Density at lat=89 varies with LST exactly as it does at
+        lat=87.5, which is not physically meaningful (LST is undefined at the
+        true pole) but is kept for backward-compatible / A-B comparisons.
+
     Spatial out-of-bounds handling:
       - LST is treated as CYCLIC with period 24 hr:
           -> lst = 24.0  behaves like 0.0
           -> lst = 23.8  interpolates across the seam with wrapped 0.0
           -> lst = -0.2  behaves like 23.8
-      - lat outside [-87.5, 87.5]:
-          -> CLAMPED to nearest pole (±87.5). No warning, no zero return.
-          -> Physically correct: grid ends at ±87.5 due to finite-difference grid,
-             not because density goes to zero there.
+      - lat outside axis bounds:
+          -> CLAMPED to the valid range for the active pole_mode
+             ("clamp": ±87.5, "cap_average": ±90).
+          -> No warning, no zero return, for finite lat.
+          -> Non-finite lat (NaN / inf) IS treated as spatial OOB: a warning
+             is emitted and density (and sigma, if present) returns 0.0, with
+             spatial_oob=True reported in the output.
           -> lat_requested and lat_used_clamped are both reported in output.
       - alt below grid minimum:
           -> emits a warning, returns 0.0 (and sigma=0.0 if available)
@@ -67,17 +83,29 @@ class DensityInterpolator:
       - alt_km <= 980          : standard RegularGridInterpolator (within grid)
       - 980 < alt_km <= 2000   : exponential extrapolation using top two grid levels
       - alt_km > 2000          : returns 0.0 immediately
+
+      Exponential-tail safety (NEW): if the top two grid levels are not
+      monotonically decreasing (rho1 >= rho0), the log-ratio scale height is
+      undefined / negative and would otherwise blow the extrapolation up
+      exponentially toward alt=2000. In that case H falls back to 100.0 km,
+      matching the existing near-zero-density fallback.
     """
 
     ALT_HARD_ZERO_KM: float = 2000.0
     LST_PERIOD_HR: float = 24.0
+    POLE_LAT_DEG: float = 90.0
 
     def __init__(
         self,
         res: Dict[str, Any],
         axes: Optional[GridAxes] = None,
         fill_value: float = np.nan,
+        pole_mode: str = "cap_average",
     ):
+        if pole_mode not in ("cap_average", "clamp"):
+            raise ValueError("pole_mode must be 'cap_average' or 'clamp'")
+        self.pole_mode = pole_mode
+
         if "window_df" not in res or "datetime" not in res["window_df"].columns:
             raise KeyError("res must contain 'window_df' with a 'datetime' column")
 
@@ -111,8 +139,8 @@ class DensityInterpolator:
 
         self._lst_min = float(self.axes.lst_axis.min())
         self._lst_max = float(self.axes.lst_axis.max())
-        self._lat_min = float(self.axes.lat_axis.min())
-        self._lat_max = float(self.axes.lat_axis.max())
+        self._lat_grid_min = float(self.axes.lat_axis.min())   # -87.5
+        self._lat_grid_max = float(self.axes.lat_axis.max())   # +87.5
         self._alt_min = float(self.axes.alt_axis.min())
         self._alt_grid_top = float(self.axes.alt_axis.max())
         self._alt_max = self.ALT_HARD_ZERO_KM
@@ -123,6 +151,18 @@ class DensityInterpolator:
         self._t_min = self.times.iloc[0]
         self._t_max = self.times.iloc[-1]
 
+        # Effective lat clamp range depends on pole_mode.
+        if self.pole_mode == "cap_average":
+            self._lat_min = -self.POLE_LAT_DEG
+            self._lat_max = self.POLE_LAT_DEG
+            self._lat_axis_ext = np.concatenate(
+                [[-self.POLE_LAT_DEG], self.axes.lat_axis, [self.POLE_LAT_DEG]]
+            )
+        else:
+            self._lat_min = self._lat_grid_min
+            self._lat_max = self._lat_grid_max
+            self._lat_axis_ext = self.axes.lat_axis
+
         # Extend cyclic LST axis with 24.0, and later repeat first slice at end.
         self._lst_axis_ext = np.append(self.axes.lst_axis, self.LST_PERIOD_HR)
 
@@ -132,11 +172,14 @@ class DensityInterpolator:
             "lst_max": self._lst_max,
             "lat_min": self._lat_min,
             "lat_max": self._lat_max,
+            "lat_grid_min": self._lat_grid_min,
+            "lat_grid_max": self._lat_grid_max,
             "alt_km_min": self._alt_min,
             "alt_km_max": self._alt_max,
             "alt_km_grid_top": self._alt_grid_top,
             "time_min": self._t_min,
             "time_max": self._t_max,
+            "pole_mode": self.pole_mode,
         }
 
     # ---------- helpers ----------
@@ -157,21 +200,32 @@ class DensityInterpolator:
 
     def _clamp_lat(self, lat: float) -> float:
         """
-        Clamp latitude to grid bounds [-87.5, 87.5].
-        Nearest-neighbor assumption: the grid ends at ±87.5 due to the
-        finite-difference discretization, not because density vanishes there.
+        Clamp latitude to the active valid range:
+          - pole_mode="cap_average": [-90, 90]
+          - pole_mode="clamp":       [-87.5, 87.5]
+
+        NaN/inf are passed through unchanged here; callers must check
+        np.isfinite(lat) separately (see _spatial_is_in_bounds), since
+        np.clip does not sanitize non-finite values.
         """
         return float(np.clip(lat, self._lat_min, self._lat_max))
 
-    def _spatial_is_in_bounds(self, lst: float, alt_km: float) -> bool:
+    def _spatial_is_in_bounds(self, lst: float, lat: float, alt_km: float) -> bool:
         """
         LST is cyclic, so it is always accepted if finite.
-        Lat is clamped before reaching here, so no lat check needed.
-        Only alt is checked for hard OOB.
+        Lat is clamped to the valid range, but non-finite lat (NaN/inf) is
+        treated as spatial OOB rather than silently propagating.
+        Alt is checked for hard OOB.
         """
         if not np.isfinite(lst):
             self._spatial_oob_warning(
                 f"[DensityInterpolator] LST is not finite ({lst}). Returning 0."
+            )
+            return False
+
+        if not np.isfinite(lat):
+            self._spatial_oob_warning(
+                f"[DensityInterpolator] lat is not finite ({lat}). Returning 0."
             )
             return False
 
@@ -203,15 +257,43 @@ class DensityInterpolator:
         """
         return np.concatenate([field_t, field_t[0:1, :, :]], axis=0)
 
+    def _extend_field_with_poles(self, field_t: np.ndarray) -> np.ndarray:
+        """
+        Prepend a south-pole cap row (LST-average of the lat=-87.5 ring) and
+        append a north-pole cap row (LST-average of the lat=+87.5 ring).
+
+        Averaging is done over the ORIGINAL 72-point LST axis (before cyclic
+        LST extension), so the duplicated 0.0-at-24.0 slice does not get
+        double weight.
+
+        Input shape:  (72, 36, 45)
+        Output shape: (72, 38, 45)
+        """
+        south_ring = field_t[:, 0, :]   # (72, 45)  -> lat = -87.5
+        north_ring = field_t[:, -1, :]  # (72, 45)  -> lat = +87.5
+
+        south_pole_val = south_ring.mean(axis=0, keepdims=True)  # (1, 45)
+        north_pole_val = north_ring.mean(axis=0, keepdims=True)  # (1, 45)
+
+        n_lst = field_t.shape[0]
+        south_pole = np.broadcast_to(south_pole_val, (n_lst, 1, field_t.shape[2]))
+        north_pole = np.broadcast_to(north_pole_val, (n_lst, 1, field_t.shape[2]))
+
+        return np.concatenate([south_pole, field_t, north_pole], axis=1)
+
     def _make_interpolator(self, field_t: np.ndarray) -> RegularGridInterpolator:
         """
         Build a spatial interpolator for one time-slice of a field.
-        Uses cyclic extension in LST.
+        Applies cyclic LST extension, and (if pole_mode="cap_average")
+        pole-cap latitude extension, in that order.
         """
-        field_ext = self._extend_field_cyclic_lst(field_t)
+        if self.pole_mode == "cap_average":
+            field_t = self._extend_field_with_poles(field_t)   # (72, 38, 45)
+
+        field_ext = self._extend_field_cyclic_lst(field_t)     # (73, 38 or 36, 45)
 
         return RegularGridInterpolator(
-            (self._lst_axis_ext, self.axes.lat_axis, self.axes.alt_axis),
+            (self._lst_axis_ext, self._lat_axis_ext, self.axes.alt_axis),
             field_ext,
             bounds_error=False,
             fill_value=self.fill_value,
@@ -225,7 +307,8 @@ class DensityInterpolator:
         ---------------------
         alt <= 980 km          : RegularGridInterpolator (trilinear within grid)
         980 < alt <= 2000 km   : exponential extrapolation anchored at grid top
-        alt > 2000 km          : 0.0 (hard zero)
+        alt > 2000 km          : 0.0 (hard zero) -- not reached here; callers
+                                   filter this via _spatial_is_in_bounds first.
 
         LST logic
         ---------
@@ -235,7 +318,11 @@ class DensityInterpolator:
 
         Lat logic
         ---------
-        Lat is already clamped to [-87.5, 87.5] before this is called.
+        Lat is already clamped to the active valid range before this is
+        called. If pole_mode="cap_average", the interpolator's lat axis is
+        extended to [-90, ..., 90] with LST-averaged pole caps, so values
+        between 87.5 and 90 interpolate smoothly toward an LST-independent
+        pole estimate.
         """
         lst = float(point[0, 0])
         lat = float(point[0, 1])
@@ -244,9 +331,6 @@ class DensityInterpolator:
         # always wrap before interpolation
         lst = self._wrap_lst(lst)
         point_wrapped = np.array([[lst, lat, alt_km]], dtype=np.float64)
-
-        if alt_km > self.ALT_HARD_ZERO_KM:
-            return 1e-16
 
         f = self._make_interpolator(field_t)
 
@@ -262,10 +346,15 @@ class DensityInterpolator:
 
         dz = self._tail_z1 - self._tail_z0
 
-        if rho0 > 0.0 and rho1 > 0.0:
+        if rho0 > 0.0 and rho1 > 0.0 and rho1 < rho0:
             log_ratio = np.log(rho0 / rho1)
             H = dz / log_ratio if log_ratio > 1e-30 else 100.0
         else:
+            # rho1 >= rho0 (non-decreasing tail) or non-positive density:
+            # log-ratio would be <= 0, giving a negative/undefined scale
+            # height and an exponentially BLOWING UP extrapolation. Fall
+            # back to a fixed scale height instead, matching the existing
+            # near-zero-density fallback.
             H = 100.0
 
         extrapolated = rho1 * np.exp(-(alt_km - self._tail_z1) / H)
@@ -291,7 +380,12 @@ class DensityInterpolator:
 
         If density_std exists in res, ALSO returns "sigma".
 
-        lat outside [-87.5, 87.5] is clamped to the nearest pole.
+        lat outside the active valid range is clamped:
+          - pole_mode="cap_average": clamped to [-90, 90], and values beyond
+            ±87.5 interpolate toward an LST-averaged pole cap.
+          - pole_mode="clamp": clamped to [-87.5, 87.5] (legacy behavior).
+        Non-finite lat (NaN/inf) is treated as spatial OOB (density=0.0,
+        spatial_oob=True), same as non-finite lst.
         lat_requested and lat_used_clamped are always reported in the output dict.
         """
         when = pd.to_datetime(when)
@@ -308,7 +402,7 @@ class DensityInterpolator:
         lst_wrapped = self._wrap_lst(lst_f)
         lat_clamped = self._clamp_lat(lat_f)
 
-        spatial_ok = self._spatial_is_in_bounds(lst_f, alt_f)
+        spatial_ok = self._spatial_is_in_bounds(lst_f, lat_f, alt_f)
         point = self._point(lst_f, lat_f, alt_f)  # already clamps lat internally
 
         i0, i1 = self._bracket_indices(when)

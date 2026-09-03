@@ -627,7 +627,7 @@ class ROPE:
             ut_var = np.tensordot(Wc, diff * diff, axes=(0, 1)).astype(np.float32)
 
             out["meta_density"] = ut_mean
-            out["density_std"] = np.sqrt(np.maximum(ut_var, 0.0)).astype(np.float32)
+            out["density_std"] = np.sqrt(np.maximum(ut_var, 0.0)).astype(np.float32) / 1.7269 # sigma scaling
 
 
 
